@@ -1,12 +1,16 @@
 import argparse
 import os
+import psycopg2
 import json
 import sys
 import csv
 import shutil
+import logging
 import datetime
 import qgis.utils
 import xml.etree.cElementTree as ET
+import zipfile
+import ast
 
 from osgeo import gdal, ogr, osr
 from gdalconst import GA_ReadOnly
@@ -46,6 +50,28 @@ from processing.tools import general
 
 
 # Help Function
+def logger(prc_dir):
+    """Function to trigger python logging"""
+    print "Create logging function"
+    log_dir = os.path.join(prc_dir, 'log')
+    log_filename = os.path.join(log_dir, 'otoklim_' + '{:%Y%m%d_%H%M%S}'.format(datetime.datetime.now()) + '.log')
+    try:
+        os.remove(log_filename)
+    except OSError:
+        pass
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.DEBUG)
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.DEBUG)
+    fh = logging.FileHandler(log_filename)
+    formatter = logging.Formatter("%(asctime)s - [%(levelname)s] %(message)s")
+    ch.setFormatter(formatter)
+    fh.setFormatter(formatter)
+    logger.addHandler(ch)
+    logger.addHandler(fh)
+    logger.info('Running start at ' + '{:%Y-%m-%d %H:%M:%S}'.format(datetime.datetime.now()))
+    return logger
+
 def create_or_replace(file):
     """Create new or replace existing directory"""
     if os.path.exists(file):
@@ -55,6 +81,26 @@ def create_or_replace(file):
     else:
         print '- Create directory: %s' % file
         os.mkdir(file)
+
+def unzip_shp(shp_unzip):
+    """Unzip Shapefile file"""
+    print '- Unzip shapefile : %s' % str(shp_unzip)
+    extract_dir = os.path.splitext(str(shp_unzip))[0]
+    if os.path.exists(extract_dir):
+        shutil.rmtree(extract_dir)
+        os.mkdir(extract_dir)
+    zip_ref = zipfile.ZipFile(shp_unzip, 'r')
+    zip_ref.extractall(extract_dir)
+    zip_ref.close()
+    shapefile = None
+    for zfile in os.listdir(extract_dir):
+        if str(os.path.splitext(zfile)[1]).lower() == ".shp":
+            shapefile = os.path.join(extract_dir, zfile)
+    if shapefile == None:
+        errormessage = 'Shapefile (.shp) is not exist in the path specified: ' + extract_dir
+        raise Exception(errormessage)
+    else:
+        return shapefile
 
 def check_shp(file, type):
     """Validate input shapefile"""
@@ -280,7 +326,8 @@ def check_csv(file, delimiter, type):
                 except:
                     error_message = ': PSH_3 [' + row['PSH_3'] + '] value must be float'
                     errormessage = 'error at line: ' + str(line) + error_message
-                    raise Exception(errormessage)    
+                    raise Exception(errormessage)
+
 
 def copy_file(sourcefile, targetdir, shp):
     """Copy file to created directory"""
@@ -393,6 +440,8 @@ def selected_region_format(slc_region):
     """Formating Selected Region"""
     print '- Formating Selected Region'
     region_formated = []
+    if type(slc_region) == str:
+        slc_region = ast.literal_eval(slc_region)
     for region in slc_region:
         if str(region[1]).upper() == "PROVINSI":
             region_formated.append([
@@ -423,13 +472,17 @@ def selected_region_format(slc_region):
 
 # Main Function
 def create_project(
+        table_name,
+        cur,
+        conn,
+        id_value,
         projectname,
         projectworkspace,
         delimiter,
-        shp_prov,
-        shp_dis,
-        shp_subdis,
-        shp_vil,
+        shp_prov_zipped,
+        shp_dis_zipped,
+        shp_subdis_zipped,
+        shp_vil_zipped,
         raster_bat,
         csv_rainpost,
         csv_rainfall,
@@ -439,7 +492,6 @@ def create_project(
         map_template_2):
     """Create new project"""
     try:
-        print 'Create New Otoklim Project'
         # Create Root Project Directory
         project_directory = projectworkspace
         create_or_replace(projectworkspace)
@@ -449,6 +501,19 @@ def create_project(
         # Log Folder
         log_directory = os.path.join(processing_directory, 'log')
         create_or_replace(log_directory)
+        # Logging Start Here
+        log = logger(processing_directory)
+        log.info('Create New Otoklim Project')
+        output_log = ""
+        output_log += 'Create New Otoklim Project \n'
+        query = (
+            "UPDATE " + table_name +
+            " SET output_log = %s "
+            " WHERE id = %s "
+        )
+        data = (str(output_log), str(id_value))
+        cur.execute(query, data)
+        conn.commit()
         # Interpolated & Classified Folder
         interpolated_directory = os.path.join(processing_directory, 'interpolated')
         create_or_replace(interpolated_directory)
@@ -469,15 +534,19 @@ def create_project(
         create_or_replace(map_directory)
         create_or_replace(csv_directory)
         # Copy Province Shapefiles
+        shp_prov = unzip_shp(shp_prov_zipped)
         check_shp(shp_prov, 'province')
         shpprov = copy_file(shp_prov, boundary_directory, True)
         # Copy Cities\Districts Shapefiles
+        shp_dis = unzip_shp(shp_dis_zipped)
         check_shp(shp_dis, 'districts')
         shpdis = copy_file(shp_dis, boundary_directory, True)
         # Copy Sub-Districts Shapefiles
+        shp_subdis = unzip_shp(shp_subdis_zipped)
         check_shp(shp_subdis, 'subdistricts')
         shpshubdis = copy_file(shp_subdis, boundary_directory, True)
         # Copy Villages Shapefiles 
+        shp_vil = unzip_shp(shp_vil_zipped)
         check_shp(shp_vil, 'villages')
         shpvil = copy_file(shp_vil, boundary_directory, True)
         # Copy Bathymetry Raster File
@@ -499,7 +568,16 @@ def create_project(
         # Copy Map Template 3 File
         map3 = copy_file(map_template_3, input_directory, False)
         # Setup Project Parameter
-        print 'Setup project parameter'
+        log.info('Setup project parameter')
+        output_log += 'Setup project parameter \n'
+        query = (
+            "UPDATE " + table_name +
+            " SET output_log = %s "
+            " WHERE id = %s "
+        )
+        data = (str(output_log), str(id_value))
+        cur.execute(query, data)
+        conn.commit()
         project_parameter = {
             'project_directory': project_directory,
             'processing_directory': processing_directory,
@@ -520,16 +598,31 @@ def create_project(
             'normalrain_rule': csvnormalrain,
             'map_template_1': map1,
             'map_template_2': map2,
-            'map_template_3': map3
+            'map_template_3': map3,
+            'log': log,
+            'output_log': output_log
         }
         return project_parameter
     except Exception as errormessage:
-        print errormessage
+        log.error(errormessage)
+        output_log += errormessage + '\n'
+        query = (
+            "UPDATE " + table_name +
+            " SET output_log = %s "
+            " WHERE id = %s "
+        )
+        data = (str(output_log), str(id_value))
+        cur.execute(query, data)
+        conn.commit()
         project_parameter = None
         return project_parameter
 
 
 def interpolate_idw(
+        table_name,
+        cur,
+        conn,
+        id_value,
         project_parameter,
         csv_delimiter,
         input_value_csv,
@@ -542,7 +635,18 @@ def interpolate_idw(
         param_list):
     """Interpolate IDW"""
     try:
-        print 'Interpolate IDW Process'
+        output_log = project_parameter['output_log']
+        log = project_parameter['log']
+        log.info('Interpolate IDW Process')
+        output_log += 'Interpolate IDW Process \n'
+        query = (
+            "UPDATE " + table_name +
+            " SET output_log = %s "
+            " WHERE id = %s "
+        )
+        data = (str(output_log), str(id_value))
+        cur.execute(query, data)
+        conn.commit()
         driver = ogr.GetDriverByName("ESRI Shapefile")
         file_directory = project_parameter['processing_directory']
         filelist = [f for f in os.listdir(file_directory) if os.path.isfile(os.path.join(file_directory, f))]
@@ -558,7 +662,16 @@ def interpolate_idw(
         years = date[1]
         check_csv(file_input, delimiter, 'input_value')
         # Combine CSV
-        print '- Start Combine CSV'
+        log.info('- Start Combine CSV')
+        output_log += '- Start Combine CSV \n'
+        query = (
+            "UPDATE " + table_name +
+            " SET output_log = %s "
+            " WHERE id = %s "
+        )
+        data = (str(output_log), str(id_value))
+        cur.execute(query, data)
+        conn.commit()
         dict_input = {}
         dict_station = {}
         with open(file_input, 'rb') as csvfile:
@@ -605,7 +718,16 @@ def interpolate_idw(
                 csv_writer.writerow(row)
 
         # CSV To Shapefile
-        print '- Convert combine CSV to Shapefile'
+        log.info('- Convert combine CSV to Shapefile')
+        output_log += '- Convert combine CSV to Shapefile \n'
+        query = (
+            "UPDATE " + table_name +
+            " SET output_log = %s "
+            " WHERE id = %s "
+        )
+        data = (str(output_log), str(id_value))
+        cur.execute(query, data)
+        conn.commit()
         csv_file = combine_file
         for param in idw_params:
             filename_shp = os.path.join(file_directory, 'rainpost_point_' + str(param) + '.shp')
@@ -659,7 +781,16 @@ def interpolate_idw(
             data_source.Destroy()
 
         # Province Polygon Query
-        print '- Create Province Polygon Shapefile'
+        log.info('- Create Province Polygon Shapefile')
+        output_log += '- Create Province Polygon Shapefile \n'
+        query = (
+            "UPDATE " + table_name +
+            " SET output_log = %s "
+            " WHERE id = %s "
+        )
+        data = (str(output_log), str(id_value))
+        cur.execute(query, data)
+        conn.commit()
         provinsi_polygon = os.path.join(file_directory, 'provinsi_polygon.shp')
         layer = QgsVectorLayer(project_parameter['shp_province'], 'provinsi', 'ogr')
         exp = "\"PROVINSI\"='{}'".format(str(province).upper())
@@ -669,7 +800,16 @@ def interpolate_idw(
         QgsVectorFileWriter.writeAsVectorFormat(layer, provinsi_polygon, "utf-8", layer.crs(), "ESRI Shapefile", 1)
 
         # Start Interpolate IDW
-        print '- Start Interpolate'
+        log.info('- Start Interpolate')
+        output_log += '- Start Interpolate \n'
+        query = (
+            "UPDATE " + table_name +
+            " SET output_log = %s "
+            " WHERE id = %s "
+        )
+        data = (str(output_log), str(id_value))
+        cur.execute(query, data)
+        conn.commit()
         layer_provinsi = QgsVectorLayer(provinsi_polygon, "lyr", "ogr")
         extent = layer_provinsi.extent()
         noip = float(number_of_interpolation)
@@ -706,14 +846,32 @@ def interpolate_idw(
             )
             if os.path.exists(raster_cliped):
                 os.remove(raster_cliped)
-            print '-- Interpolating for param: %s' % str(param)
+            log.info('-- Interpolating for param: %s' % str(param))
+            output_log += '-- Interpolating for param: %s' % str(param) + ' \n'
+            query = (
+                "UPDATE " + table_name +
+                " SET output_log = %s "
+                " WHERE id = %s "
+            )
+            data = (str(output_log), str(id_value))
+            cur.execute(query, data)
+            conn.commit()
             general.runalg(
                 'grass7:v.surf.idw',
                 layer, noip, power, param, False,
                 "%f,%f,%f,%f" % (extent.xMinimum(), extent.xMaximum(), extent.yMinimum(), extent.yMaximum()), cell_size, -1.0, 0.0001,
                 raster_interpolated
             )
-            print '-- Clipping raster interpolated'
+            log.info('-- Clipping raster interpolated')
+            output_log += '-- Clipping raster interpolated \n'
+            query = (
+                "UPDATE " + table_name +
+                " SET output_log = %s "
+                " WHERE id = %s "
+            )
+            data = (str(output_log), str(id_value))
+            cur.execute(query, data)
+            conn.commit()
             raster_layer = QgsRasterLayer(raster_interpolated, 'raster')
             mask_layer = QgsVectorLayer(provinsi_polygon, 'mask', 'ogr')
             general.runandload("gdalogr:cliprasterbymasklayer",
@@ -734,13 +892,26 @@ def interpolate_idw(
                 "",
                 raster_cliped)
             output_rasters.update({str(param).lower() : raster_cliped})
-        return output_rasters, idw_params
+        return output_rasters, idw_params, output_log
     except Exception as errormessage:
-        print errormessage
+        log.error(errormessage)
+        output_log += errormessage + '\n'
+        query = (
+            "UPDATE " + table_name +
+            " SET output_log = %s "
+            " WHERE id = %s "
+        )
+        data = (str(output_log), str(id_value))
+        cur.execute(query, data)
+        conn.commit()
         output_rasters = None
         return output_rasters
 
 def raster_classify(
+        table_name,
+        cur,
+        conn,
+        id_value,
         project_parameter,
         interpolated,
         filename_rainfall,
@@ -749,7 +920,18 @@ def raster_classify(
         param_list):
     """Classify Raster Interpolated"""
     try:
-        print 'Classify Raster Interpolated'
+        log = project_parameter['log']
+        log.info('Classify Raster Interpolated')
+        output_log = interpolated[2]
+        output_log += 'Classify Raster Interpolated \n'
+        query = (
+            "UPDATE " + table_name +
+            " SET output_log = %s "
+            " WHERE id = %s "
+        )
+        data = (str(output_log), str(id_value))
+        cur.execute(query, data)
+        conn.commit()
         prc_list = []
         file_directory = project_parameter['processing_directory']
         idw_params = interpolated[1]
@@ -778,12 +960,30 @@ def raster_classify(
         if os.path.exists(output_rainfall):
             os.remove(output_rainfall)
         row_keeper = []
-        print '- Read classification rule from %s ' % str(filename_rainfall)
+        log.info('- Read classification rule from %s ' % str(filename_rainfall))
+        output_log += '- Read classification rule from %s ' % str(filename_rainfall) + ' \n'
+        query = (
+            "UPDATE " + table_name +
+            " SET output_log = %s "
+            " WHERE id = %s "
+        )
+        data = (str(output_log), str(id_value))
+        cur.execute(query, data)
+        conn.commit()
         with open(filename_rainfall, 'rb') as csvfile:
             spamreader = csv.DictReader(csvfile, delimiter=',', quotechar='|')
             for row in spamreader:
                 row_keeper.append([row['lower_limit'], row['upper_limit'], row['new_value']])
-        print '- Write classification rule to %s ' % str(output_rainfall)
+        log.info('- Write classification rule to %s ' % str(output_rainfall))
+        output_log += '- Write classification rule to %s ' % str(output_rainfall) + ' \n'
+        query = (
+            "UPDATE " + table_name +
+            " SET output_log = %s "
+            " WHERE id = %s "
+        )
+        data = (str(output_log), str(id_value))
+        cur.execute(query, data)
+        conn.commit()
         with open(output_rainfall, "wb+") as txtfile:
             txt_writer = csv.writer(txtfile, delimiter=':')
             for row in row_keeper:
@@ -796,18 +996,45 @@ def raster_classify(
         if os.path.exists(output_normalrain):
             os.remove(output_normalrain)
         row_keeper = []
-        print '- Read classification rule from %s ' % str(filename_normalrain)
+        log.info('- Read classification rule from %s ' % str(filename_normalrain))
+        output_log += '- Read classification rule from %s ' % str(filename_normalrain) + ' \n' 
+        query = (
+            "UPDATE " + table_name +
+            " SET output_log = %s "
+            " WHERE id = %s "
+        )
+        data = (str(output_log), str(id_value))
+        cur.execute(query, data)
+        conn.commit()
         with open(filename_normalrain, 'rb') as csvfile:
             spamreader = csv.DictReader(csvfile, delimiter=',', quotechar='|')
             for row in spamreader:
                 row_keeper.append([row['lower_limit'], row['upper_limit'], row['new_value']])
-        print '- Write classification rule to %s ' % str(output_normalrain)
+        log.info('- Write classification rule to %s ' % str(output_normalrain))
+        output_log += '- Write classification rule to %s ' % str(output_normalrain) + ' \n'
+        query = (
+            "UPDATE " + table_name +
+            " SET output_log = %s "
+            " WHERE id = %s "
+        )
+        data = (str(output_log), str(id_value))
+        cur.execute(query, data)
+        conn.commit()
         with open(output_normalrain, "wb+") as txtfile:
             txt_writer = csv.writer(txtfile, delimiter=':')
             for row in row_keeper:
                 txt_writer.writerow(row)
         # Start Classifying Raster
-        print '- Start Classifying Raster'
+        log.info('- Start Classifying Raster')
+        output_log += '- Start Classifying Raster \n'
+        query = (
+            "UPDATE " + table_name +
+            " SET output_log = %s "
+            " WHERE id = %s "
+        )
+        data = (str(output_log), str(id_value))
+        cur.execute(query, data)
+        conn.commit()
         output_rasters = {}
         output_vectors = {}
         for param in prc_list:
@@ -821,7 +1048,16 @@ def raster_classify(
             provinsi_polygon = os.path.join(file_directory, 'provinsi_polygon.shp')
             layer_provinsi = QgsVectorLayer(provinsi_polygon, "lyr", "ogr")
             extent = layer_provinsi.extent()
-            print '-- Classifying for param: %s' % str(param)
+            log.info('-- Classifying for param: %s' % str(param))
+            output_log += '-- Classifying for param: %s' % str(param) + ' \n'  
+            query = (
+                "UPDATE " + table_name +
+                " SET output_log = %s "
+                " WHERE id = %s "
+            )
+            data = (str(output_log), str(id_value))
+            cur.execute(query, data)
+            conn.commit()
             if param[0:3] == 'ach' or param[0:3] == 'pch':
                 general.runalg(
                     'grass7:r.recode',
@@ -855,11 +1091,29 @@ def raster_classify(
                 except OSError:
                     pass
             # Polygonize
-            print '-- Convert to vector polygon'
+            log.info('-- Convert to vector polygon')
+            output_log += '-- Convert to vector polygon \n'
+            query = (
+                "UPDATE " + table_name +
+                " SET output_log = %s "
+                " WHERE id = %s "
+            )
+            data = (str(output_log), str(id_value))
+            cur.execute(query, data)
+            conn.commit()
             general.runalg("gdalogr:polygonize", raster_classified, "DN", vector_classified)
 
             # Add Attribute
-            print '-- Add new attribute'
+            log.info('-- Add new attribute')
+            output_log += '-- Add new attribute \n'
+            query = (
+                "UPDATE " + table_name +
+                " SET output_log = %s "
+                " WHERE id = %s "
+            )
+            data = (str(output_log), str(id_value))
+            cur.execute(query, data)
+            conn.commit()
             layer_vector_classified = QgsVectorLayer(vector_classified, 'vector_classified', 'ogr')
             res = layer_vector_classified.dataProvider().addAttributes(
                 [
@@ -870,7 +1124,16 @@ def raster_classify(
             )
             layer_vector_classified.updateFields()
             # Record Label, Value and Color
-            print '-- Record label, value, and color'
+            log.info('-- Record label, value, and color')
+            output_log += '-- Record label, value, and color \n'
+            query = (
+                "UPDATE " + table_name +
+                " SET output_log = %s "
+                " WHERE id = %s "
+            )
+            data = (str(output_log), str(id_value))
+            cur.execute(query, data)
+            conn.commit()
             label_value = {}
             if str(param)[0:3].upper() == 'ACH' or str(param)[0:3].upper() == 'PCH':
                 color = []
@@ -912,7 +1175,16 @@ def raster_classify(
                         label_value.update({row['new_value']: (label_str, row['color'])})
 
             # Set Attribute
-            print '-- Set attribute'
+            log.info('-- Set attribute')
+            output_log += '-- Set attribute \n'
+            query = (
+                "UPDATE " + table_name +
+                " SET output_log = %s "
+                " WHERE id = %s "
+            )
+            data = (str(output_log), str(id_value))
+            cur.execute(query, data)
+            conn.commit()
             expression = QgsExpression("area(transform($geometry, 'EPSG:4326','EPSG:3857'))")
             index = layer_vector_classified.fieldNameIndex("Area")
             expression.prepare(layer_vector_classified.pendingFields())
@@ -940,7 +1212,16 @@ def raster_classify(
                 )
             layer_vector_classified.commitChanges()
             # Render Vector Style
-            print '-- Rendering and save style'
+            log.info('-- Rendering and save style')
+            output_log += '-- Rendering and save style \n'
+            query = (
+                "UPDATE " + table_name +
+                " SET output_log = %s "
+                " WHERE id = %s "
+            )
+            data = (str(output_log), str(id_value))
+            cur.execute(query, data)
+            conn.commit()
             style_file_qml = os.path.join(
                 project_parameter['classified_directory'],
                 'classified_' + str(param) + '.qml'
@@ -962,22 +1243,30 @@ def raster_classify(
             # Add to dictionary
             output_rasters.update({str(param).lower() : raster_classified})
             output_vectors.update({str(param).lower() : vector_classified})
-        return output_rasters, output_vectors, idw_params
+        return output_rasters, output_vectors, idw_params, output_log
     except Exception as errormessage:
-        print errormessage
+        log.error(errormessage)
+        output_log += errormessage + '\n'
+        query = (
+            "UPDATE " + table_name +
+            " SET output_log = %s "
+            " WHERE id = %s "
+        )
+        data = (str(output_log), str(id_value))
+        cur.execute(query, data)
+        conn.commit()
         return None
 
 
 def generate_map(
+        table_name,
+        cur,
+        conn,
+        id_value,
         project_parameter,
         classified,
         month,
         year,
-        province_shp,
-        districts_shp,
-        subdistricts_shp,
-        village_shp,
-        bathymetry_raster,
         param_list,
         selected_region,
         map_template_1,
@@ -992,18 +1281,44 @@ def generate_map(
     ):
     """Genetare Map"""
     try:
-        print 'Generate Map'
+        log = project_parameter['log']
+        log.info('Generate Map')
+        output_log = classified[3]
+        output_log += 'Generate Map \n'
+        query = (
+            "UPDATE " + table_name +
+            " SET output_log = %s "
+            " WHERE id = %s "
+        )
+        data = (str(output_log), str(id_value))
+        cur.execute(query, data)
+        conn.commit()
         file_directory = project_parameter['project_directory']
         prcs_directory = project_parameter['processing_directory']
         out_directory = project_parameter['output_directory']
         map_directory = project_parameter['map_directory']
         filename_xml = os.path.join(map_directory, 'phb.xml')
         classified_directory = project_parameter['classified_directory']
+        # Spatial File
+        province_shp = project_parameter['shp_province']
+        districts_shp = project_parameter['shp_districts']
+        subdistricts_shp = project_parameter['shp_subdistricts']
+        village_shp = project_parameter['shp_villages']
+        bathymetry_raster = project_parameter['raster_bathymetry']
         date = select_date_now(month, year)
         months = date[0]
         years = date[1]
         # Create PHB XML
-        print '- Create PHB XML'
+        log.info('- Create PHB XML')
+        output_log += '- Create PHB XML \n'
+        query = (
+            "UPDATE " + table_name +
+            " SET output_log = %s "
+            " WHERE id = %s "
+        )
+        data = (str(output_log), str(id_value))
+        cur.execute(query, data)
+        conn.commit()
         curah_hujan = ET.Element("curah_hujan")
         forecast = ET.SubElement(curah_hujan, "forecast")
         params = ET.SubElement(curah_hujan, "params")
@@ -1075,42 +1390,114 @@ def generate_map(
         tree = ET.ElementTree(curah_hujan)
         tree.write(filename_xml, encoding='utf-8', xml_declaration=True)
         # Read Selected Region
-        print '- Read Selected Region'
+        log.info('- Read Selected Region')
+        output_log += '- Read Selected Region \n'
+        query = (
+            "UPDATE " + table_name +
+            " SET output_log = %s "
+            " WHERE id = %s "
+        )
+        data = (str(output_log), str(id_value))
+        cur.execute(query, data)
+        conn.commit()
         items = selected_region_format(selected_region)
         slc_id_list = [int(float(i[1])) for i in items]
         slc_name_list = [str(i[0]) for i in items]
         slc_nametitle_list = [str(i[2]) for i in items]
         # Polygon to Line Conversion
-        print '- Polygon to Line Conversion'
+        log.info('- Polygon to Line Conversion')
+        output_log += '- Polygon to Line Conversion \n'
+        query = (
+            "UPDATE " + table_name +
+            " SET output_log = %s "
+            " WHERE id = %s "
+        )
+        data = (str(output_log), str(id_value))
+        cur.execute(query, data)
+        conn.commit()
         provinsi_line = os.path.join(prcs_directory, 'provinsi_line.shp')
         if not os.path.exists(provinsi_line):
-            print '-- Convert Province Boundary'
+            log.info('-- Convert Province Boundary')
+            output_log += '-- Convert Province Boundary \n'
+            query = (
+                "UPDATE " + table_name +
+                " SET output_log = %s "
+                " WHERE id = %s "
+            )
+            data = (str(output_log), str(id_value))
+            cur.execute(query, data)
+            conn.commit()
             general.runandload("qgis:polygonstolines", province_shp, provinsi_line)
             lineprovince = QgsMapLayerRegistry.instance().mapLayersByName('Lines from polygons')[0]
             QgsMapLayerRegistry.instance().removeMapLayer(lineprovince.id())
         kabupaten_line = os.path.join(prcs_directory, 'kabupaten_line.shp')
         if not os.path.exists(kabupaten_line):
-            print '-- Convert Districts Boundary'
+            log.info('-- Convert Districts Boundary')
+            output_log += '-- Convert Districts Boundary \n'
+            query = (
+                "UPDATE " + table_name +
+                " SET output_log = %s "
+                " WHERE id = %s "
+            )
+            data = (str(output_log), str(id_value))
+            cur.execute(query, data)
+            conn.commit()
             general.runandload("qgis:polygonstolines", districts_shp, kabupaten_line)
             linekabupaten = QgsMapLayerRegistry.instance().mapLayersByName('Lines from polygons')[0]
             QgsMapLayerRegistry.instance().removeMapLayer(linekabupaten.id())
         kecamatan_line = os.path.join(prcs_directory, 'kecamatan_line.shp')
         if not os.path.exists(kecamatan_line):
-            print '-- Convert Sub-Districts Boundary'
+            log.info('-- Convert Sub-Districts Boundary')
+            output_log += '-- Convert Sub-Districts Boundary \n'
+            query = (
+                "UPDATE " + table_name +
+                " SET output_log = %s "
+                " WHERE id = %s "
+            )
+            data = (str(output_log), str(id_value))
+            cur.execute(query, data)
+            conn.commit()
             general.runandload("qgis:polygonstolines", subdistricts_shp, kecamatan_line)
             linekecamatan = QgsMapLayerRegistry.instance().mapLayersByName('Lines from polygons')[0]
             QgsMapLayerRegistry.instance().removeMapLayer(linekecamatan.id())
         desa_line = os.path.join(prcs_directory, 'desa_line.shp')
         if not os.path.exists(desa_line):
-            print '-- Convert Villages Boundary'
+            log.info('-- Convert Villages Boundary')
+            output_log += '-- Convert Villages Boundary \n'
+            query = (
+                "UPDATE " + table_name +
+                " SET output_log = %s "
+                " WHERE id = %s "
+            )
+            data = (str(output_log), str(id_value))
+            cur.execute(query, data)
+            conn.commit()
             general.runandload("qgis:polygonstolines", village_shp, desa_line)
             linedesa = QgsMapLayerRegistry.instance().mapLayersByName('Lines from polygons')[0]
             QgsMapLayerRegistry.instance().removeMapLayer(linedesa.id())
 
         # Start Listing
-        print '- Generate Map in Progress'
+        log.info('- Generate Map in Progress')
+        output_log += '- Generate Map in Progress \n'
+        query = (
+            "UPDATE " + table_name +
+            " SET output_log = %s "
+            " WHERE id = %s "
+        )
+        data = (str(output_log), str(id_value))
+        cur.execute(query, data)
+        conn.commit()
         for value, date in zip(prc_list, date_list):
-            print '-- Field (Parameter) : ' + value[0]
+            log.info('-- Field (Parameter) : ' + value[0])
+            output_log += '-- Field (Parameter) : ' + value[0] + ' \n'  
+            query = (
+                "UPDATE " + table_name +
+                " SET output_log = %s "
+                " WHERE id = %s "
+            )
+            data = (str(output_log), str(id_value))
+            cur.execute(query, data)
+            conn.commit()
             vector_classified = str(value[1])
             vector_classified_filename = os.path.basename(str(value[1]))
             style_file = os.path.join(classified_directory, os.path.splitext(vector_classified_filename)[0] + '.qml')
@@ -1120,7 +1507,16 @@ def generate_map(
             month = date[0]
             year = date[1]
             for slc_id, slc_name, slc_nametitle in zip(slc_id_list, slc_name_list, slc_nametitle_list):
-                print '--- Region processed : ' + slc_name
+                log.info('--- Region processed : ' + slc_name)
+                output_log += '--- Region processed : ' + slc_name + ' \n'
+                query = (
+                    "UPDATE " + table_name +
+                    " SET output_log = %s "
+                    " WHERE id = %s "
+                )
+                data = (str(output_log), str(id_value))
+                cur.execute(query, data)
+                conn.commit()
                 projectqgs = os.path.join(
                     prcs_directory,
                     '%s_qgisproject_%s_%s.qgs' % (
@@ -1533,28 +1929,54 @@ def generate_map(
                         QgsMapLayerRegistry.instance().removeMapLayers(all_layer)
                         del vector
                         os.remove(projectqgs)
+        return output_log
     except Exception as errormessage:
-        print errormessage
+        log.error(errormessage)
+        output_log += errormessage + '\n'
+        query = (
+            "UPDATE " + table_name +
+            " SET output_log = %s "
+            " WHERE id = %s "
+        )
+        data = (str(output_log), str(id_value))
+        cur.execute(query, data)
+        conn.commit()
         return None
 
 
 def generate_csv(
+        output_log,
+        table_name,
+        cur,
+        conn,
+        id_value,
         project_parameter,
         classified,
-        districts_shp,
-        subdistricts_shp,
-        village_shp,
         param_list,
         selected_region,
     ):
     """Genetare CSV"""
     try:
-        print 'Generate CSV'
+        log = project_parameter['log']
+        log.info('Generate CSV')
+        output_log += 'Generate CSV \n'
+        query = (
+            "UPDATE " + table_name +
+            " SET output_log = %s "
+            " WHERE id = %s "
+        )
+        data = (str(output_log), str(id_value))
+        cur.execute(query, data)
+        conn.commit()
         file_directory = project_parameter['project_directory']
         prcs_directory = project_parameter['processing_directory']
         out_directory = project_parameter['output_directory']
         csv_directory = project_parameter['csv_directory']
         classified_directory = project_parameter['classified_directory']
+        # Spatial File
+        districts_shp = project_parameter['shp_districts']
+        subdistricts_shp = project_parameter['shp_subdistricts']
+        village_shp = project_parameter['shp_villages']
         idw_params = classified[2]
         vector_classified = classified[1]
         raster_classified = classified[0]
@@ -1601,12 +2023,30 @@ def generate_csv(
         else:
             prc_list_fixed.append(['', ''])
         # Read Selected Region
-        print '- Read Selected Region'
+        log.info('- Read Selected Region')
+        output_log += '- Read Selected Region \n'
+        query = (
+            "UPDATE " + table_name +
+            " SET output_log = %s "
+            " WHERE id = %s "
+        )
+        data = (str(output_log), str(id_value))
+        cur.execute(query, data)
+        conn.commit()
         items = selected_region_format(selected_region)
         slc_id_list = [int(float(i[1])) for i in items]
         if len(prc_list) > 0:
             # Create CSV Default File
-            print '- Create CSV Default File'
+            log.info('- Create CSV Default File')
+            output_log += '- Create CSV Default File \n'
+            query = (
+                "UPDATE " + table_name +
+                " SET output_log = %s "
+                " WHERE id = %s "
+            )
+            data = (str(output_log), str(id_value))
+            cur.execute(query, data)
+            conn.commit()
             driver = ogr.GetDriverByName("ESRI Shapefile")
             kabupaten_csv = os.path.join(csv_directory, 'kabupaten.csv')
             kecamatan_csv = os.path.join(csv_directory, 'kecamatan.csv')
@@ -1637,7 +2077,16 @@ def generate_csv(
 
             check_slc = []
             for shp, output_csv, output_json, region_id in zip(shp_list, output_csv_list, output_json_list, region_id_list):
-                print '--- Generate in progress for :' + str(output_csv)
+                log.info('--- Generate in progress for :' + str(output_csv))
+                output_log += '--- Generate in progress for :' + str(output_csv) + ' \n'
+                query = (
+                    "UPDATE " + table_name +
+                    " SET output_log = %s "
+                    " WHERE id = %s "
+                )
+                data = (str(output_log), str(id_value))
+                cur.execute(query, data)
+                conn.commit()
                 n = 1
                 if region_id in csv_edit:
                     with open(output_csv, "wb+") as csvfile:
@@ -1660,19 +2109,46 @@ def generate_csv(
                                 continue_run = True
                                 if len(str(slc_id)) == 2 and region_id == 1:
                                     check_slc.append(slc_id)
-                                    print '---- Region : ' + str(slc_id)
+                                    log.info('---- Region : ' + str(slc_id))
+                                    output_log += '---- Region : ' + str(slc_id) + ' \n'
+                                    query = (
+                                        "UPDATE " + table_name +
+                                        " SET output_log = %s "
+                                        " WHERE id = %s "
+                                    )
+                                    data = (str(output_log), str(id_value))
+                                    cur.execute(query, data)
+                                    conn.commit()
                                     layer = QgsVectorLayer(shp, "PROVINSI", "ogr")
                                     exp = "\"ID_PROV\"='{}'".format(str(slc_id))
                                     layer.setSubsetString(exp)
                                 elif len(str(slc_id)) == 4 and region_id == 2:
                                     check_slc.append(slc_id)
-                                    print '---- Region : ' + str(slc_id)
+                                    log.info('---- Region : ' + str(slc_id))
+                                    output_log += '---- Region : ' + str(slc_id) + ' \n'
+                                    query = (
+                                        "UPDATE " + table_name +
+                                        " SET output_log = %s "
+                                        " WHERE id = %s "
+                                    )
+                                    data = (str(output_log), str(id_value))
+                                    cur.execute(query, data)
+                                    conn.commit()
                                     layer = QgsVectorLayer(shp, "KABUPATEN", "ogr")
                                     exp = "\"ID_KAB\"='{}'".format(str(slc_id))
                                     layer.setSubsetString(exp)
                                 elif len(str(slc_id)) == 7 and region_id == 3:
                                     check_slc.append(slc_id)
-                                    print '---- Region : ' + str(slc_id)
+                                    log.info('---- Region : ' + str(slc_id))
+                                    output_log += '---- Region : ' + str(slc_id) + ' \n'
+                                    query = (
+                                        "UPDATE " + table_name +
+                                        " SET output_log = %s "
+                                        " WHERE id = %s "
+                                    )
+                                    data = (str(output_log), str(id_value))
+                                    cur.execute(query, data)
+                                    conn.commit()
                                     layer = QgsVectorLayer(shp, "KECAMATAN", "ogr")
                                     exp = "\"ID_KEC\"='{}'".format(str(slc_id))
                                     layer.setSubsetString(exp)
@@ -1682,7 +2158,16 @@ def generate_csv(
                                     union_list = {}
                                     temp_list = []
                                     for prc in prc_list:
-                                        print '----- Union :' + str(slc_id) + ' & ' + str(prc[0])
+                                        log.info('----- Union :' + str(slc_id) + ' & ' + str(prc[0]))
+                                        output_log += '----- Union :' + str(slc_id) + ' & ' + str(prc[0]) + ' \n'
+                                        query = (
+                                            "UPDATE " + table_name +
+                                            " SET output_log = %s "
+                                            " WHERE id = %s "
+                                        )
+                                        data = (str(output_log), str(id_value))
+                                        cur.execute(query, data)
+                                        conn.commit()
                                         vector_classified = os.path.join(classified_directory, prc[1])
                                         temp = os.path.join(prcs_directory, 'tmp_' + str(prc[0]))
                                         temp_list.append(temp)
@@ -1692,14 +2177,32 @@ def generate_csv(
                                         general.runandload("qgis:union", vector_classified, layer, union)
                                         layer_union = QgsMapLayerRegistry.instance().mapLayersByName('Union')[0]
                                         QgsMapLayerRegistry.instance().removeMapLayer(layer_union)
-                                        print '----- Union success.. Vector data has been stored on ' + str(union)
+                                        log.info('----- Union success.. Vector data has been stored on ' + str(union))
+                                        output_log += '----- Union success.. Vector data has been stored on ' + str(union) + ' \n'
+                                        query = (
+                                            "UPDATE " + table_name +
+                                            " SET output_log = %s "
+                                            " WHERE id = %s "
+                                        )
+                                        data = (str(output_log), str(id_value))
+                                        cur.execute(query, data)
+                                        conn.commit()
                                         union_list.update({str(prc[0]):  str(union)})
                                     dataSource = driver.Open(shp, 0)
                                     layersource = dataSource.GetLayer()
                                     for feature in layersource:
                                         if (region_id == 1 and feature.GetField("ID_PROV") == slc_id) or (region_id == 2 and feature.GetField("ID_KAB") == slc_id) or (region_id == 3 and feature.GetField("ID_KEC") == slc_id):
                                             if region_id == 1:
-                                                print '---- Region : ' + str(feature.GetField("ID_KAB"))
+                                                log.info('---- Region : ' + str(feature.GetField("ID_KAB")))
+                                                output_log += '---- Region : ' + str(feature.GetField("ID_KAB")) + ' \n'
+                                                query = (
+                                                    "UPDATE " + table_name +
+                                                    " SET output_log = %s "
+                                                    " WHERE id = %s "
+                                                )
+                                                data = (str(output_log), str(id_value))
+                                                cur.execute(query, data)
+                                                conn.commit()
                                                 main_values = {
                                                     'No': n,
                                                     'Provinsi': feature.GetField("PROVINSI"),
@@ -1708,7 +2211,16 @@ def generate_csv(
                                                 }
                                                 exp = "\"ID_KAB\"='{}'".format(str(feature.GetField("ID_KAB")))
                                             elif region_id == 2:
-                                                print '---- Region : ' + str(feature.GetField("ID_KEC"))
+                                                log.info('---- Region : ' + str(feature.GetField("ID_KEC")))
+                                                output_log += '---- Region : ' + str(feature.GetField("ID_KEC")) + ' \n'
+                                                query = (
+                                                    "UPDATE " + table_name +
+                                                    " SET output_log = %s "
+                                                    " WHERE id = %s "
+                                                )
+                                                data = (str(output_log), str(id_value))
+                                                cur.execute(query, data)
+                                                conn.commit()
                                                 main_values = {
                                                     'No': n,
                                                     'Provinsi': feature.GetField("PROVINSI"),
@@ -1719,7 +2231,16 @@ def generate_csv(
                                                 }
                                                 exp = "\"ID_KEC\"='{}'".format(str(feature.GetField("ID_KEC")))
                                             else:
-                                                print '---- Region : ' + str(feature.GetField("ID_DES"))
+                                                log.info('---- Region : ' + str(feature.GetField("ID_DES")))
+                                                output_log += '---- Region : ' + str(feature.GetField("ID_DES")) + ' \n'
+                                                query = (
+                                                    "UPDATE " + table_name +
+                                                    " SET output_log = %s "
+                                                    " WHERE id = %s "
+                                                )
+                                                data = (str(output_log), str(id_value))
+                                                cur.execute(query, data)
+                                                conn.commit()
                                                 main_values = {
                                                     'No': n,
                                                     'Provinsi': feature.GetField("PROVINSI"),
@@ -1734,7 +2255,16 @@ def generate_csv(
                                             param_values = {}
                                             for prc in prc_list:
                                                 # Calculate Area
-                                                print '----- Calculate Area Classified: ' + str(prc[0])
+                                                log.info('----- Calculate Area Classified: ' + str(prc[0]))
+                                                output_log += '----- Calculate Area Classified: ' + str(prc[0]) + ' \n'
+                                                query = (
+                                                    "UPDATE " + table_name +
+                                                    " SET output_log = %s "
+                                                    " WHERE id = %s "
+                                                )
+                                                data = (str(output_log), str(id_value))
+                                                cur.execute(query, data)
+                                                conn.commit()
                                                 sbk = {}
                                                 sb = {}
                                                 sbb = {}
@@ -1792,7 +2322,16 @@ def generate_csv(
                                                     prc[0].upper() + '_M': m
                                                 })
                                             # JSON Structure
-                                            print '----- Write JSON'
+                                            log.info('----- Write JSON')
+                                            output_log += '----- Write JSON \n'
+                                            query = (
+                                                "UPDATE " + table_name +
+                                                " SET output_log = %s "
+                                                " WHERE id = %s "
+                                            )
+                                            data = (str(output_log), str(id_value))
+                                            cur.execute(query, data)
+                                            conn.commit()
                                             json_values = {}
                                             json_values.update({"VALUES": param_values})
                                             json_values.update(main_values)
@@ -1804,7 +2343,16 @@ def generate_csv(
                                                 json_desa.append(json_values)
                                             # CSV Structure
                                             main_values.update(param_values)
-                                            print '----- Write CSV'
+                                            log.info('----- Write CSV')
+                                            output_log += '----- Write CSV \n'
+                                            query = (
+                                                "UPDATE " + table_name +
+                                                " SET output_log = %s "
+                                                " WHERE id = %s "
+                                            )
+                                            data = (str(output_log), str(id_value))
+                                            cur.execute(query, data)
+                                            conn.commit()
                                             csv_writer.writerow(main_values)
                                             n += 1
                                     del layer_union    
@@ -1819,270 +2367,358 @@ def generate_csv(
                         else:
                             jsonfile.write(json.dumps(json_desa, indent=4))
     except Exception as errormessage:
-        print errormessage
+        log.info(errormessage)
+        output_log += errormessage + '\n'
+        query = (
+            "UPDATE " + table_name +
+            " SET output_log = %s "
+            " WHERE id = %s "
+        )
+        data = (str(output_log), str(id_value))
+        cur.execute(query, data)
+        conn.commit()
         return None
 
 
 if __name__ == '__main__':
-    # Initialize the parser
-    parser = argparse.ArgumentParser(
-        description="Parsing Otoklim Parameter"
-    )
-
-    # Files Storage Path & Folder
-    currentpath = os.path.dirname(os.path.abspath(__file__))
-    filepath = 'sample_files'
-    projectpath = 'dirproject'
-
-    # Add parameter
-    # sudo python run_otoklim.py --param value --param2 value2
-    # Project Parameter
-    parser.add_argument('--project_name', help="Project Name", type=str, nargs='?', const="project1")
-    parser.add_argument('--csv_delimiter', help="CSV Input Delimiter", type=str, nargs='?', const=",")
-    parser.add_argument(
-        '--province_shp',
-        help="Shapefile for Province Administration Boundary in Indonesia",
-        type=str, nargs='?',
-        const=os.path.join(currentpath, filepath, 'Admin_Provinsi_BPS2013_GEO.shp')
-    )
-    parser.add_argument(
-        '--districts_shp',
-        help="Shapefile for Districts Administration Boundary in Indonesia",
-        type=str, nargs='?',
-        const=os.path.join(currentpath, filepath, 'Admin_Kabupaten_BPS2013_GEO.shp')
-    )
-    parser.add_argument(
-        '--subdistricts_shp',
-        help="Shapefile for Sub-districts Administration Boundary in Indonesia",
-        type=str, nargs='?',
-        const=os.path.join(currentpath, filepath, 'Admin_Kecamatan_BPS2013_GEO.shp')
-    )
-    parser.add_argument(
-        '--village_shp',
-        help="Shapefile for Villages Administration Boundary in Indonesia",
-        type=str, nargs='?',
-        const=os.path.join(currentpath, filepath, 'Admin_Desa_BPS2013_GEO.shp')
-    )
-    parser.add_argument(
-        '--bathymetry_raster',
-        help="Bathymetry file around Indonesia in raster",
-        type=str, nargs='?',
-        const=os.path.join(currentpath, filepath, 'byth_gebco_invert.tif')
-    )
-    parser.add_argument(
-        '--rainpost_file',
-        help="BMKG Rainpost data in CSV format including Location in Lat\lon",
-        type=str, nargs='?',
-        const=os.path.join(currentpath, filepath, 'rainpost_jatim.csv')
-    )
-    parser.add_argument(
-        '--rainfall_class',
-        help="Classification rule for rainfall such as domain, range, and color in CSV",
-        type=str, nargs='?',
-        const=os.path.join(currentpath, filepath, 'rule_ch.csv')
-    )
-    parser.add_argument(
-        '--normalrain_class',
-        help="Classification rule for normal rain such as domain, range, and color in CSV",
-        type=str, nargs='?',
-        const=os.path.join(currentpath, filepath, 'rule_sh.csv')
-    )
-    parser.add_argument(
-        '--map_template_1',
-        help="QGIS Template (QPT) file that will be used for province map",
-        type=str, nargs='?',
-        const=os.path.join(currentpath, filepath, 'template', 'jatim_ch.qpt')
-    )
-    parser.add_argument(
-        '--map_template_2',
-        help="QGIS Template (QPT) file that will be used for districts map",
-        type=str, nargs='?',
-        const=os.path.join(currentpath, filepath, 'template', 'jatim_umum_ch.qpt')
-    )
-    parser.add_argument(
-        '--map_template_3',
-        help="QGIS Template (QPT) file that will be used for sub-districts map",
-        type=str, nargs='?',
-        const=os.path.join(currentpath, filepath, 'template', 'jatim_umum_ch.qpt')
-    )
-
-    # Param To Be Processed
-    parser.add_argument(
-        '--param_list',
-        help="List of Param to be processed",
-        type=str, nargs='?',
-        #const=['ach_1', 'ash_1', 'pch_1', 'psh_1', 'pch_2', 'psh_2', 'pch_3', 'psh_3']
-        const=['ach_1']
-    )
-
-    # Interpolation Parameter and Classification Parameter
-    parser.add_argument(
-        '--input_value_csv',
-        help="Value of rainpost data in CSV",
-        type=str, nargs='?',
-        const=os.path.join(currentpath, filepath, 'input_sample_jatim.csv')
-    )
-    parser.add_argument('--province', help="Province Name", type=str, nargs='?', const="Jawa Timur")
-    parser.add_argument('--month', help="Current Month", type=int, nargs='?', const=datetime.datetime.now().month)
-    parser.add_argument('--year', help="Current Year", type=int, nargs='?', const=datetime.datetime.now().year)
-    parser.add_argument('--number_of_interpolation', help="Number of Interpolation for IDW", type=float, nargs='?', const=8.0)
-    parser.add_argument('--power_parameter', help="Power parameter for IDW", type=float, nargs='?', const=5.0)
-    parser.add_argument('--cell_size', help="Output raster interpolated cell size in degrees", type=float, nargs='?', const=0.001)
-
-    # Generate MAP and CSV Parameter
-    parser.add_argument(
-        '--selected_region',
-        help="List of Region to be processed",
-        type=str, nargs='?',
-        #const=[['JAWA TIMUR', 'PROVINSI', 35],['BANYUWANGI', 'KABUPATEN', 3510, 'JAWA TIMUR'],['TEGALDLIMO', 'KECAMATAN', 3510040, 'BANYUWANGI', 'JAWA TIMUR']]
-        const=[['JAWA TIMUR', 'PROVINSI', 35]]
-    )
-    parser.add_argument('--date_produced', help="Date when map is produced", type=str, nargs='?', const="??")
-    parser.add_argument(
-        '--northarrow',
-        help="Northarrow icon for map",
-        type=str, nargs='?',
-        const=os.path.join(currentpath, filepath, 'northarrow.PNG')
-    )
-    parser.add_argument(
-        '--logo',
-        help="Logo image for map",
-        type=str, nargs='?',
-        const=os.path.join(currentpath, filepath, 'logo_jatim.png')
-    )
-    parser.add_argument(
-        '--inset',
-        help="Inser for province map",
-        type=str, nargs='?',
-        const=os.path.join(currentpath, filepath, 'jatim_inset.png')
-    )
-    parser.add_argument(
-        '--legenda_ch',
-        help="Map Legend for rainfall",
-        type=str, nargs='?',
-        const=os.path.join(currentpath, filepath, 'legenda_ch_landscape.PNG')
-    )
-    parser.add_argument(
-        '--legenda_sh',
-        help="Map Legend for normalrain",
-        type=str, nargs='?',
-        const=os.path.join(currentpath, filepath, 'legenda_sh_landscape.PNG')
-    )
-
-    # Parse the arguments
-    arguments = parser.parse_args()
-
-    # Project Parameter
-    project_name = arguments.project_name
-    print project_name
-    project_workspace = os.path.join(currentpath, projectpath, project_name)
-    csv_delimiter = arguments.csv_delimiter
-    province_shp = arguments.province_shp
-    districts_shp = arguments.districts_shp
-    subdistricts_shp = arguments.subdistricts_shp
-    village_shp = arguments.village_shp
-    bathymetry_raster = arguments.bathymetry_raster
-    rainpost_file = arguments.rainpost_file
-    rainfall_class = arguments.rainfall_class
-    normalrain_class = arguments.normalrain_class
-    map_template_1 = arguments.map_template_1
-    map_template_2 = arguments.map_template_2
-    map_template_3 = arguments.map_template_3
-    # Param To Be Processed
-    param_list = arguments.param_list
-    # Interpolation and Classification Parameter
-    input_value_csv = arguments.input_value_csv
-    province = arguments.province
-    month = arguments.month
-    year = arguments.year
-    number_of_interpolation = arguments.number_of_interpolation
-    power_parameter = arguments.power_parameter
-    cell_size = arguments.cell_size
-    # Generate MAP and CSV Parameter
-    selected_region = arguments.selected_region
-    date_produced = arguments.date_produced
-    northarrow = arguments.northarrow
-    logo = arguments.logo
-    inset = arguments.inset
-    legenda_ch = arguments.legenda_ch
-    legenda_sh = arguments.legenda_sh
-
-    # Run Otoklim
-    project_parameter = create_project(
-        project_name,
-        project_workspace,
-        csv_delimiter,
-        province_shp,
-        districts_shp,
-        subdistricts_shp,
-        village_shp,
-        bathymetry_raster,
-        rainpost_file,
-        rainfall_class,
-        normalrain_class,
-        map_template_1,
-        map_template_2,
-        map_template_3
-    )
-    if project_parameter:
-        interpolated = interpolate_idw(
-            project_parameter,
-            csv_delimiter,
-            input_value_csv,
-            province,
-            month,
-            year,
-            number_of_interpolation,
-            power_parameter,
-            cell_size,
-            param_list
+    try:
+        # Start Time
+        start_time = '{:%Y-%m-%d %H:%M:%S}'.format(datetime.datetime.now())
+        # Initialize the parser
+        parser = argparse.ArgumentParser(
+            description="Parsing Otoklim Parameter"
         )
-    else:
-        interpolated = None
 
-    if interpolated and project_parameter:
-        classified = raster_classify(
-            project_parameter,
-            interpolated,
-            rainfall_class,
-            normalrain_class,
-            csv_delimiter,
-            param_list
+        # Files Storage Path & Folder
+        currentpath = os.path.dirname(os.path.abspath(__file__))
+        filepath = 'sample_files'
+        projectpath = os.path.join('uploaded', 'dirproject')
+
+        # Add parameter
+        # Databases Parameter
+        parser.add_argument('--id_value', help="PK Value", type=str, nargs='?', const="0")
+        parser.add_argument('--dbname', help="Name of databases", type=str)
+        parser.add_argument('--user', help="Databases user", type=str)
+        parser.add_argument('--host', help="Host", type=str)
+        parser.add_argument('--password', help="Password", type=str)
+
+        # Otoklim Site
+        parser.add_argument('--otoklim_site', help="Password", type=str, nargs='?', const="url")
+
+        # Project Parameter
+        parser.add_argument('--project_name', help="Project Name", type=str, nargs='?', const="project1")
+        parser.add_argument('--csv_delimiter', help="CSV Input Delimiter", type=str, nargs='?', const=",")
+        parser.add_argument(
+            '--province_shp',
+            help="Shapefile for Province Administration Boundary in Indonesia",
+            type=str, nargs='?',
+            const=os.path.join(currentpath, filepath, 'Admin_Provinsi_BPS2013_GEO.zip')
         )
-    else:
-        classified = None
+        parser.add_argument(
+            '--districts_shp',
+            help="Shapefile for Districts Administration Boundary in Indonesia",
+            type=str, nargs='?',
+            const=os.path.join(currentpath, filepath, 'Admin_Kabupaten_BPS2013_GEO.zip')
+        )
+        parser.add_argument(
+            '--subdistricts_shp',
+            help="Shapefile for Sub-districts Administration Boundary in Indonesia",
+            type=str, nargs='?',
+            const=os.path.join(currentpath, filepath, 'Admin_Kecamatan_BPS2013_GEO.zip')
+        )
+        parser.add_argument(
+            '--village_shp',
+            help="Shapefile for Villages Administration Boundary in Indonesia",
+            type=str, nargs='?',
+            const=os.path.join(currentpath, filepath, 'Admin_Desa_BPS2013_GEO.zip')
+        )
+        parser.add_argument(
+            '--bathymetry_raster',
+            help="Bathymetry file for Indonesia ocean in raster",
+            type=str, nargs='?',
+            const=os.path.join(currentpath, filepath, 'byth_gebco_invert.tif')
+        )
+        parser.add_argument(
+            '--rainpost_file',
+            help="BMKG Rainpost data in CSV format including Location in Lat\lon",
+            type=str, nargs='?',
+            const=os.path.join(currentpath, filepath, 'rainpost_jatim.csv')
+        )
+        parser.add_argument(
+            '--rainfall_class',
+            help="Classification rule for rainfall such as domain, range, and color in CSV",
+            type=str, nargs='?',
+            const=os.path.join(currentpath, filepath, 'rule_ch.csv')
+        )
+        parser.add_argument(
+            '--normalrain_class',
+            help="Classification rule for normal rain such as domain, range, and color in CSV",
+            type=str, nargs='?',
+            const=os.path.join(currentpath, filepath, 'rule_sh.csv')
+        )
+        parser.add_argument(
+            '--map_template_1',
+            help="QGIS Template (QPT) file that will be used for province map",
+            type=str, nargs='?',
+            const=os.path.join(currentpath, filepath, 'template', 'jatim_ch.qpt')
+        )
+        parser.add_argument(
+            '--map_template_2',
+            help="QGIS Template (QPT) file that will be used for districts map",
+            type=str, nargs='?',
+            const=os.path.join(currentpath, filepath, 'template', 'jatim_umum_ch.qpt')
+        )
+        parser.add_argument(
+            '--map_template_3',
+            help="QGIS Template (QPT) file that will be used for sub-districts map",
+            type=str, nargs='?',
+            const=os.path.join(currentpath, filepath, 'template', 'jatim_umum_ch.qpt')
+        )
 
-    if classified and project_parameter:
-        generate_map(
-            project_parameter,
-            classified,
-            month,
-            year,
+        # Param To Be Processed
+        parser.add_argument(
+            '--param_list',
+            help="List of Param to be processed",
+            type=str, nargs='?',
+            #const=['ach_1', 'ash_1', 'pch_1', 'psh_1', 'pch_2', 'psh_2', 'pch_3', 'psh_3']
+            const=['ach_1']
+        )
+
+        # Interpolation Parameter and Classification Parameter
+        parser.add_argument(
+            '--input_value_csv',
+            help="Values for every rainpost data in CSV",
+            type=str, nargs='?',
+            const=os.path.join(currentpath, filepath, 'input_sample_jatim.csv')
+        )
+        parser.add_argument('--province', help="Province Name", type=str, nargs='?', const="Jawa Timur")
+        parser.add_argument('--month', help="Current Month", type=int, nargs='?', const=datetime.datetime.now().month)
+        parser.add_argument('--year', help="Current Year", type=int, nargs='?', const=datetime.datetime.now().year)
+        parser.add_argument('--number_of_interpolation', help="Number of Interpolation for IDW", type=float, nargs='?', const=8.0)
+        parser.add_argument('--power_parameter', help="Power parameter for IDW", type=float, nargs='?', const=5.0)
+        parser.add_argument('--cell_size', help="Output raster interpolated cell size in degrees", type=float, nargs='?', const=0.001)
+
+        # Generate MAP and CSV Parameter
+        parser.add_argument(
+            '--selected_region',
+            help="List of Region to be processed",
+            type=str, nargs='?',
+            const=[['JAWA TIMUR', 'PROVINSI', 35],['BANYUWANGI', 'KABUPATEN', 3510, 'JAWA TIMUR'],['TEGALDLIMO', 'KECAMATAN', 3510040, 'BANYUWANGI', 'JAWA TIMUR']]
+            #const=[['JAWA TIMUR', 'PROVINSI', 35]]
+        )
+        parser.add_argument('--date_produced', help="Date when map is produced", type=str, nargs='?', const="??")
+        parser.add_argument(
+            '--northarrow',
+            help="Northarrow icon for map",
+            type=str, nargs='?',
+            const=os.path.join(currentpath, filepath, 'northarrow.PNG')
+        )
+        parser.add_argument(
+            '--logo',
+            help="Logo image for map",
+            type=str, nargs='?',
+            const=os.path.join(currentpath, filepath, 'logo_jatim.png')
+        )
+        parser.add_argument(
+            '--inset',
+            help="Inser for province map",
+            type=str, nargs='?',
+            const=os.path.join(currentpath, filepath, 'jatim_inset.png')
+        )
+        parser.add_argument(
+            '--legenda_ch',
+            help="Map Legend for rainfall",
+            type=str, nargs='?',
+            const=os.path.join(currentpath, filepath, 'legenda_ch_landscape.PNG')
+        )
+        parser.add_argument(
+            '--legenda_sh',
+            help="Map Legend for normalrain",
+            type=str, nargs='?',
+            const=os.path.join(currentpath, filepath, 'legenda_sh_landscape.PNG')
+        )
+
+        # Parse the arguments
+        arguments = parser.parse_args()
+
+        # Set Databases Parameter
+        id_value = arguments.id_value
+        dbname = arguments.dbname
+        user = arguments.user
+        host = arguments.host
+        password = arguments.password
+        conn = psycopg2.connect("dbname=%s user=%s host=%s password=%s" % (dbname, user, host, password))
+        cur = conn.cursor()
+        table_name = "otoklim_otoklimjob"
+        # Start Update DB
+        create_time = '{:%Y-%m-%d %H:%M:%S}'.format(datetime.datetime.now())
+        query = (
+            "UPDATE " + table_name +
+            " SET started_at = %s, "
+            " created_at = %s, "
+            " status = %s "
+            " WHERE id = %s "
+        )
+        data = (start_time, create_time, 'started', str(id_value))
+        cur.execute(query, data)
+        conn.commit()
+
+        # Project Parameter
+        project_name = arguments.project_name
+        otoklim_site = arguments.otoklim_site
+        project_fullpath = os.path.join(otoklim_site, 'projects', project_name + '/')
+        query = (
+            "UPDATE " + table_name +
+            " SET project_url = %s "
+            " WHERE id = %s "
+        )
+        data = (str(project_fullpath), str(id_value))
+        cur.execute(query, data)
+        conn.commit()
+        project_workspace = os.path.join(currentpath, projectpath, project_name)
+        csv_delimiter = arguments.csv_delimiter
+        province_shp = arguments.province_shp
+        districts_shp = arguments.districts_shp
+        subdistricts_shp = arguments.subdistricts_shp
+        village_shp = arguments.village_shp
+        bathymetry_raster = arguments.bathymetry_raster
+        rainpost_file = arguments.rainpost_file
+        rainfall_class = arguments.rainfall_class
+        normalrain_class = arguments.normalrain_class
+        map_template_1 = arguments.map_template_1
+        map_template_2 = arguments.map_template_2
+        map_template_3 = arguments.map_template_3
+        # Param To Be Processed
+        param_list = arguments.param_list
+        # Interpolation and Classification Parameter
+        input_value_csv = arguments.input_value_csv
+        province = arguments.province
+        month = arguments.month
+        year = arguments.year
+        number_of_interpolation = arguments.number_of_interpolation
+        power_parameter = arguments.power_parameter
+        cell_size = arguments.cell_size
+        # Generate MAP and CSV Parameter
+        selected_region = arguments.selected_region
+        date_produced = arguments.date_produced
+        northarrow = arguments.northarrow
+        logo = arguments.logo
+        inset = arguments.inset
+        legenda_ch = arguments.legenda_ch
+        legenda_sh = arguments.legenda_sh
+
+        # Run Otoklim
+        finish = False
+        output_log = ""
+        project_parameter = create_project(
+            table_name,
+            cur,
+            conn,
+            id_value,
+            project_name,
+            project_workspace,
+            csv_delimiter,
             province_shp,
             districts_shp,
             subdistricts_shp,
             village_shp,
             bathymetry_raster,
-            param_list,
-            selected_region,
+            rainpost_file,
+            rainfall_class,
+            normalrain_class,
             map_template_1,
             map_template_2,
-            map_template_3,
-            date_produced,
-            northarrow,
-            legenda_ch,
-            legenda_sh,
-            logo,
-            inset,
+            map_template_3
         )
+        if project_parameter:
+            interpolated = interpolate_idw(
+                table_name,
+                cur,
+                conn,
+                id_value,
+                project_parameter,
+                csv_delimiter,
+                input_value_csv,
+                province,
+                month,
+                year,
+                number_of_interpolation,
+                power_parameter,
+                cell_size,
+                param_list
+            )
+        else:
+            interpolated = None
 
-    if classified and project_parameter:
-        generate_csv(
-            project_parameter,
-            classified,
-            districts_shp,
-            subdistricts_shp,
-            village_shp,
-            param_list,
-            selected_region,
+        if interpolated and project_parameter:
+            classified = raster_classify(
+                table_name,
+                cur,
+                conn,
+                id_value,
+                project_parameter,
+                interpolated,
+                rainfall_class,
+                normalrain_class,
+                csv_delimiter,
+                param_list
+            )
+        else:
+            classified = None
+
+        if classified and project_parameter:
+            output_log = generate_map(
+                table_name,
+                cur,
+                conn,
+                id_value,
+                project_parameter,
+                classified,
+                month,
+                year,
+                param_list,
+                selected_region,
+                map_template_1,
+                map_template_2,
+                map_template_3,
+                date_produced,
+                northarrow,
+                legenda_ch,
+                legenda_sh,
+                logo,
+                inset,
+            )
+
+        if classified and project_parameter:
+            generate_csv(
+                output_log,
+                table_name,
+                cur,
+                conn,
+                id_value,
+                project_parameter,
+                classified,
+                param_list,
+                selected_region,
+            )
+            finish = True
+
+        # Otoklim Finished \ Failed
+        end_time = '{:%Y-%m-%d %H:%M:%S}'.format(datetime.datetime.now())
+        query = (
+            "UPDATE " + table_name +
+            " SET ended_at = %s, "
+            " status = %s"
+            " WHERE id = %s "
         )
+        if finish:
+            data = (end_time, 'finished', str(id_value))
+        else:
+            data = (end_time, 'failed', str(id_value))
+        cur.execute(query, data)
+        conn.commit()
+        # DB Close
+        cur.close()
+        conn.close()
+    except Exception as err:
+        print str(err)
