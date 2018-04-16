@@ -11,11 +11,14 @@ import qgis.utils
 import xml.etree.cElementTree as ET
 import zipfile
 import ast
+import geoserver.util
 
 from osgeo import gdal, ogr, osr
 from gdalconst import GA_ReadOnly
 from qgis.core import *
 from qgis.gui import QgsMapCanvas, QgsLayerTreeMapCanvasBridge
+
+from geoserver.catalog import Catalog
 
 from PyQt4.QtCore import *
 from PyQt4.QtXml import QDomDocument
@@ -1258,7 +1261,122 @@ def raster_classify(
         return None
 
 
+def push_to_geoserver(
+        gs_url,
+        gs_username,
+        gs_password,
+        project_name,
+        otoklim_site,
+        project_parameter,
+        classified
+    ):
+    """Push to Geoserver"""
+    try:
+        log = project_parameter['log']
+        log.info('Push Classified Shp to GeoServer')
+        output_log = classified[3]
+        output_log += 'Push Classified Shp to GeoServer \n'
+        query = (
+            "UPDATE " + table_name +
+            " SET output_log = %s "
+            " WHERE id = %s "
+        )
+        data = (str(output_log), str(id_value))
+        cur.execute(query, data)
+        conn.commit()
+        shp_dir = project_parameter["classified_directory"]
+        cat = Catalog(
+            gs_url,
+            username= gs_username,
+            password= gs_password
+        )
+        # Create Workspace
+        workspacename = 'otoklim_' + project_name
+        try:
+            log.info("- Create Otoklim Workspace")
+            output_log += '- Create Otoklim Workspace \n'
+            query = (
+                "UPDATE " + table_name +
+                " SET output_log = %s "
+                " WHERE id = %s "
+            )
+            data = (str(output_log), str(id_value))
+            cur.execute(query, data)
+            conn.commit()
+            ws = cat.create_workspace(workspacename, otoklim_site)
+        except:
+            log.info("- Skip.. Otoklim workspace already created")
+            output_log += '- Skip.. Otoklim workspace already created \n'
+            query = (
+                "UPDATE " + table_name +
+                " SET output_log = %s "
+                " WHERE id = %s "
+            )
+            data = (str(output_log), str(id_value))
+            cur.execute(query, data)
+            conn.commit()
+            ws = cat.get_workspace(workspacename)
+        # Create Feature Store
+        log.info("- Create Feature Store")
+        output_log += '- Create Feature Store \n'
+        query = (
+            "UPDATE " + table_name +
+            " SET output_log = %s "
+            " WHERE id = %s "
+        )
+        data = (str(output_log), str(id_value))
+        cur.execute(query, data)
+        conn.commit()
+        shp_list = [shp.split(".")[0] for shp in os.listdir(shp_dir)]
+        for shp in list(set(shp_list)):
+            shp_path = os.path.join(shp_dir, shp)
+            classified_file = geoserver.util.shapefile_and_friends(shp_path)
+            # Create Feature Store
+            try:
+                log.info("-- Create feature store for : %s" % shp)
+                output_log += '-- Create feature store for : %s \n' % shp
+                query = (
+                    "UPDATE " + table_name +
+                    " SET output_log = %s "
+                    " WHERE id = %s "
+                )
+                data = (str(output_log), str(id_value))
+                cur.execute(query, data)
+                conn.commit()
+                cat.create_featurestore(str(shp), classified_file, ws)
+                sldfile = shp_path + ".sld"
+                with open(sldfile) as f:
+                    cat.create_style(str(shp), f.read(), overwrite=True, style_format="sld11")
+                layer = cat.get_layer("%s:%s" % (workspacename, str(shp)))
+                layer._set_default_style(str(shp))
+                cat.save(layer)
+            except:
+                log.info("-- %s store already exists" % shp)
+                output_log += '-- %s store already exists \n' % shp
+                query = (
+                    "UPDATE " + table_name +
+                    " SET output_log = %s "
+                    " WHERE id = %s "
+                )
+                data = (str(output_log), str(id_value))
+                cur.execute(query, data)
+                conn.commit()
+        return output_log
+    except Exception as errormessage:
+        log.error(errormessage)
+        output_log += errormessage + '\n'
+        query = (
+            "UPDATE " + table_name +
+            " SET output_log = %s "
+            " WHERE id = %s "
+        )
+        data = (str(output_log), str(id_value))
+        cur.execute(query, data)
+        conn.commit()
+        return None
+
 def generate_map(
+        output_log,
         table_name,
         cur,
         conn,
@@ -1283,7 +1401,6 @@ def generate_map(
     try:
         log = project_parameter['log']
         log.info('Generate Map')
-        output_log = classified[3]
         output_log += 'Generate Map \n'
         query = (
             "UPDATE " + table_name +
@@ -2403,7 +2520,12 @@ if __name__ == '__main__':
         parser.add_argument('--password', help="Password", type=str)
 
         # Otoklim Site
-        parser.add_argument('--otoklim_site', help="Password", type=str, nargs='?', const="url")
+        parser.add_argument('--otoklim_site', help="Otoklim Site", type=str, nargs='?', const="url")
+
+        # Geoserver Parameter
+        parser.add_argument('--gs_url', help="Geo Server URL", type=str)
+        parser.add_argument('--gs_username', help="Geo Server Username")
+        parser.add_argument('--gs_password', help="Geo Server Password")
 
         # Project Parameter
         parser.add_argument('--project_name', help="Project Name", type=str, nargs='?', const="project1")
@@ -2503,8 +2625,8 @@ if __name__ == '__main__':
             '--selected_region',
             help="List of Region to be processed",
             type=str, nargs='?',
-            const=[['JAWA TIMUR', 'PROVINSI', 35],['BANYUWANGI', 'KABUPATEN', 3510, 'JAWA TIMUR'],['TEGALDLIMO', 'KECAMATAN', 3510040, 'BANYUWANGI', 'JAWA TIMUR']]
-            #const=[['JAWA TIMUR', 'PROVINSI', 35]]
+            #const=[['JAWA TIMUR', 'PROVINSI', 35],['BANYUWANGI', 'KABUPATEN', 3510, 'JAWA TIMUR'],['TEGALDLIMO', 'KECAMATAN', 3510040, 'BANYUWANGI', 'JAWA TIMUR']]
+            const=[['JAWA TIMUR', 'PROVINSI', 35]]
         )
         parser.add_argument('--date_produced', help="Date when map is produced", type=str, nargs='?', const="??")
         parser.add_argument(
@@ -2563,8 +2685,16 @@ if __name__ == '__main__':
         cur.execute(query, data)
         conn.commit()
 
+        # Geoserver Parameter
+        gs_url = arguments.gs_url
+        gs_username = arguments.gs_username
+        gs_password = arguments.gs_password
+    
         # Project Parameter
         project_name = arguments.project_name
+        project_name = project_name.strip()
+        project_name = project_name.replace(" ", "_")
+        # Clean project name
         otoklim_site = arguments.otoklim_site
         project_fullpath = os.path.join(otoklim_site, 'projects', project_name + '/')
         query = (
@@ -2667,7 +2797,19 @@ if __name__ == '__main__':
             classified = None
 
         if classified and project_parameter:
-            output_log = generate_map(
+            output_log_1 = push_to_geoserver(
+                gs_url,
+                gs_username,
+                gs_password,
+                project_name,
+                otoklim_site,
+                project_parameter,
+                classified
+            )
+
+        if classified and project_parameter:
+            output_log_2 = generate_map(
+                output_log_1,
                 table_name,
                 cur,
                 conn,
@@ -2686,12 +2828,12 @@ if __name__ == '__main__':
                 legenda_ch,
                 legenda_sh,
                 logo,
-                inset,
+                inset
             )
 
         if classified and project_parameter:
             generate_csv(
-                output_log,
+                output_log_2,
                 table_name,
                 cur,
                 conn,
