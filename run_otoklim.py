@@ -57,7 +57,7 @@ def logger(prc_dir):
     """Function to trigger python logging"""
     print "Create logging function"
     log_dir = os.path.join(prc_dir, 'log')
-    log_filename = os.path.join(log_dir, 'otoklim_' + '{:%Y%m%d_%H%M%S}'.format(datetime.datetime.now()) + '.log')
+    log_filename = os.path.join(log_dir, 'otoklim_' + '{:%Y%m%d_%H%M%S}'.format(datetime.datetime.now()) + '.txt')
     try:
         os.remove(log_filename)
     except OSError:
@@ -74,6 +74,22 @@ def logger(prc_dir):
     logger.addHandler(fh)
     logger.info('Running start at ' + '{:%Y-%m-%d %H:%M:%S}'.format(datetime.datetime.now()))
     return logger
+
+def remove_sld_stroke(stylefile):
+    """Remove unexpected stroke from SLD file"""
+    linelist = []
+    opentag = '<se:Stroke>'
+    color = '<se:SvgParameter name="stroke">#000000</se:SvgParameter>'
+    stroke = '<se:SvgParameter name="stroke-linejoin">bevel</se:SvgParameter>'
+    closetag = '</se:Stroke>'
+    with open(stylefile, "r") as file_r:
+        for line in file_r.read().splitlines():
+            if (opentag not in line) and (color not in line) and (stroke not in line) and (closetag not in line):
+                linelist.append(line)
+
+    with open(stylefile, "w") as file_w:
+        for line in linelist:
+            file_w.write(line + "\n")
 
 def create_or_replace(file):
     """Create new or replace existing directory"""
@@ -536,6 +552,9 @@ def create_project(
         csv_directory = os.path.join(output_directory, 'csv')
         create_or_replace(map_directory)
         create_or_replace(csv_directory)
+        # WMS Folder
+        wms_directory = os.path.join(output_directory, 'wms')
+        create_or_replace(wms_directory)
         # Copy Province Shapefiles
         shp_prov = unzip_shp(shp_prov_zipped)
         check_shp(shp_prov, 'province')
@@ -591,6 +610,7 @@ def create_project(
             'output_directory': output_directory,
             'map_directory': map_directory,
             'csv_directory': csv_directory,
+            'wms_directory': wms_directory,
             'shp_province': shpprov,
             'shp_districts': shpdis,
             'shp_subdistricts': shpshubdis,
@@ -1243,6 +1263,7 @@ def raster_classify(
             layer_vector_classified.setRendererV2(renderer)
             layer_vector_classified.saveNamedStyle(style_file_qml)
             layer_vector_classified.saveSldStyle(style_file_sld)
+            remove_sld_stroke(style_file_sld)
             # Add to dictionary
             output_rasters.update({str(param).lower() : raster_classified})
             output_vectors.update({str(param).lower() : vector_classified})
@@ -1266,8 +1287,11 @@ def push_to_geoserver(
         gs_username,
         gs_password,
         project_name,
-        otoklim_site,
+        project_fullpath,
         project_parameter,
+        year,
+        month,
+        province,
         classified
     ):
     """Push to Geoserver"""
@@ -1291,7 +1315,10 @@ def push_to_geoserver(
             password= gs_password
         )
         # Create Workspace
-        workspacename = 'otoklim_' + project_name
+        date = select_date_now(month, year)
+        year = date[1][4]
+        month = date[0][4]
+        workspacename = 'otoklim_%s_%s%s' % (project_name, str(year), str(month))
         try:
             log.info("- Create Otoklim Workspace")
             output_log += '- Create Otoklim Workspace \n'
@@ -1303,7 +1330,7 @@ def push_to_geoserver(
             data = (str(output_log), str(id_value))
             cur.execute(query, data)
             conn.commit()
-            ws = cat.create_workspace(workspacename, otoklim_site)
+            ws = cat.create_workspace(workspacename, project_fullpath)
         except:
             log.info("- Skip.. Otoklim workspace already created")
             output_log += '- Skip.. Otoklim workspace already created \n'
@@ -1316,6 +1343,9 @@ def push_to_geoserver(
             cur.execute(query, data)
             conn.commit()
             ws = cat.get_workspace(workspacename)
+        # Create wms.txt
+        wms_dir = project_parameter['wms_directory']
+        wms_file = os.path.join(wms_dir, "wms.json")
         # Create Feature Store
         log.info("- Create Feature Store")
         output_log += '- Create Feature Store \n'
@@ -1328,6 +1358,13 @@ def push_to_geoserver(
         cur.execute(query, data)
         conn.commit()
         shp_list = [shp.split(".")[0] for shp in os.listdir(shp_dir)]
+        wms_dict = {
+            "Project Name": str(project_name),
+            "Year": str(year),
+            "Month": str(month),
+            "Province": str(province),
+        }
+        wms_list = []
         for shp in list(set(shp_list)):
             shp_path = os.path.join(shp_dir, shp)
             classified_file = geoserver.util.shapefile_and_friends(shp_path)
@@ -1345,11 +1382,21 @@ def push_to_geoserver(
                 conn.commit()
                 cat.create_featurestore(str(shp), classified_file, ws)
                 sldfile = shp_path + ".sld"
+                style_name = '%s_%s' % (workspacename, str(shp))
                 with open(sldfile) as f:
-                    cat.create_style(str(shp), f.read(), overwrite=True, style_format="sld11")
+                    cat.create_style(style_name, f.read(), overwrite=True, style_format="sld11")
                 layer = cat.get_layer("%s:%s" % (workspacename, str(shp)))
-                layer._set_default_style(str(shp))
+                layer._set_default_style(style_name)
                 cat.save(layer)
+                # Add service to wms dictionary
+                wms_service = "%s/%s/wms?service=WMS&request=GetMap&layers=%s:%s" % (
+                    str(os.path.dirname(gs_url)),
+                    str(workspacename),
+                    str(workspacename),
+                    str(shp)
+                )
+                param_name = "_".join(shp.split("_")[1:3])
+                wms_list.append({"layer_name": param_name, "wms_url": wms_service})
             except:
                 log.info("-- %s store already exists" % shp)
                 output_log += '-- %s store already exists \n' % shp
@@ -1361,6 +1408,10 @@ def push_to_geoserver(
                 data = (str(output_log), str(id_value))
                 cur.execute(query, data)
                 conn.commit()
+        # Write WMS Json
+        wms_dict.update({"Layers" : wms_list})
+        with open(wms_file, 'w') as fp:
+            json.dump(wms_dict, fp, indent=4)
         return output_log
     except Exception as errormessage:
         log.error(errormessage)
@@ -2694,18 +2745,7 @@ if __name__ == '__main__':
         project_name = arguments.project_name
         project_name = project_name.strip()
         project_name = project_name.replace(" ", "_")
-        # Clean project name
         otoklim_site = arguments.otoklim_site
-        project_fullpath = os.path.join(otoklim_site, 'projects', project_name + '/')
-        query = (
-            "UPDATE " + table_name +
-            " SET project_url = %s "
-            " WHERE id = %s "
-        )
-        data = (str(project_fullpath), str(id_value))
-        cur.execute(query, data)
-        conn.commit()
-        project_workspace = os.path.join(currentpath, projectpath, project_name)
         csv_delimiter = arguments.csv_delimiter
         province_shp = arguments.province_shp
         districts_shp = arguments.districts_shp
@@ -2736,6 +2776,21 @@ if __name__ == '__main__':
         inset = arguments.inset
         legenda_ch = arguments.legenda_ch
         legenda_sh = arguments.legenda_sh
+        # Project Workspace and URL
+        date = select_date_now(month, year)
+        yr = date[1][4]
+        mt = date[0][4]
+        project_workspace = os.path.join(currentpath, projectpath, "%s_%s%s" % (project_name, str(yr), str(mt)))
+        project_name_yyyymm = "%s_%s%s" % (project_name, yr, mt)
+        project_fullpath = os.path.join(otoklim_site, 'projects', project_name_yyyymm + '/')
+        query = (
+            "UPDATE " + table_name +
+            " SET project_url = %s "
+            " WHERE id = %s "
+        )
+        data = (str(project_fullpath), str(id_value))
+        cur.execute(query, data)
+        conn.commit()
 
         # Run Otoklim
         finish = False
@@ -2802,8 +2857,11 @@ if __name__ == '__main__':
                 gs_username,
                 gs_password,
                 project_name,
-                otoklim_site,
+                project_fullpath,
                 project_parameter,
+                year,
+                month,
+                province,
                 classified
             )
 
